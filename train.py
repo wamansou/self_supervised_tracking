@@ -17,7 +17,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from data_generator import SyntheticParticleDataset
-from model import FlowEstimatorUNet
+from model import FlowEstimatorRAFT
 from losses import SelfSupervisedTrackingLoss
 from visualizer import TrainingVisualizer
 
@@ -34,17 +34,23 @@ DEFAULT_CONFIG = {
     "num_particles_range": [500, 2000],
     "noise_level": 0.05,
     "max_displacement": 8.0,
-    # ----- Model -----
-    "base_features": 64,
+    # ----- Model (RAFT) -----
+    "feature_dim": 256,
+    "hidden_dim": 128,
+    "context_dim": 128,
+    "corr_levels": 4,
+    "corr_radius": 4,
+    "num_iters": 12,
     # ----- Loss weights -----
     "lambda_photo": 1.0,
     "lambda_div": 0.3,
     "lambda_smooth": 0.15,
     "ssim_weight": 0.5,
+    "gamma": 0.8,
     # ----- Optimiser -----
-    "batch_size": 64,
+    "batch_size": 16,
     "num_epochs": 80,
-    "learning_rate": 3e-4,
+    "learning_rate": 2e-4,
     "weight_decay": 1e-5,
     # ----- Misc -----
     "num_workers": 8,
@@ -100,25 +106,26 @@ def train(cfg):
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    # ---- Model ----
-    model = FlowEstimatorUNet(
-        in_channels=2, base_features=cfg["base_features"]
+    # ---- Model (RAFT) ----
+    model = FlowEstimatorRAFT(
+        feature_dim=cfg["feature_dim"],
+        hidden_dim=cfg["hidden_dim"],
+        context_dim=cfg["context_dim"],
+        corr_levels=cfg["corr_levels"],
+        corr_radius=cfg["corr_radius"],
+        num_iters=cfg["num_iters"],
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")
-
-    # ---- torch.compile (PyTorch 2.x graph-mode speedup) ----
-    if hasattr(torch, "compile"):
-        model = torch.compile(model)
-        print("torch.compile enabled")
 
     # ---- Loss / Optimiser / Scheduler ----
     criterion = SelfSupervisedTrackingLoss(
         cfg["lambda_photo"], cfg["lambda_div"], cfg["lambda_smooth"],
         ssim_weight=cfg["ssim_weight"],
+        gamma=cfg["gamma"],
     )
-    optimizer = optim.Adam(
-        model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"]
+    optimizer = optim.AdamW(
+        model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"],
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["num_epochs"], eta_min=cfg["learning_rate"] * 0.01
@@ -169,8 +176,8 @@ def train(cfg):
             img1, img2 = images[:, 0:1], images[:, 1:2]
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                pred = model(images)
-                loss, ld = criterion(img1, img2, pred)
+                flow_preds = model(images)
+                loss, ld = criterion(img1, img2, flow_preds)
 
             optimizer.zero_grad()
             if scaler is not None:
@@ -203,14 +210,15 @@ def train(cfg):
                 img1, img2 = images[:, 0:1], images[:, 1:2]
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    pred = model(images)
-                    loss, ld = criterion(img1, img2, pred)
+                    flow_preds = model(images)
+                    loss, ld = criterion(img1, img2, flow_preds)
 
                 for k in va:
                     va[k] += ld[k]
 
                 # End-point error (supervised metric — for monitoring only)
-                epe = torch.sqrt(((pred - gt_flow) ** 2).sum(dim=1)).mean()
+                pred_final = flow_preds[-1]
+                epe = torch.sqrt(((pred_final - gt_flow) ** 2).sum(dim=1)).mean()
                 epe_sum += epe.item()
 
         n_va = len(val_loader)
@@ -240,7 +248,7 @@ def train(cfg):
                 viz_imgs, viz_gt = next(iter(val_loader))
                 viz_imgs = viz_imgs.to(device)
                 viz_gt = viz_gt.to(device)
-                viz_pred = model(viz_imgs)
+                viz_pred = model(viz_imgs)[-1]   # final iteration
                 viz.log_images(epoch, viz_imgs, viz_pred, viz_gt)
 
         # Best model
@@ -290,7 +298,8 @@ def parse_args():
     p.add_argument("--bs",       type=int,   default=None, help="Batch size")
     p.add_argument("--lr",       type=float, default=None, help="Learning rate")
     p.add_argument("--img-size", type=int,   default=None, help="Image size (px)")
-    p.add_argument("--features", type=int,   default=None, help="Base feature count")
+    p.add_argument("--features", type=int,   default=None, help="Feature encoder dim")
+    p.add_argument("--iters",    type=int,   default=None, help="RAFT refinement iterations")
     p.add_argument("--l-photo",  type=float, default=None, help="Photo loss weight")
     p.add_argument("--l-div",    type=float, default=None, help="Div loss weight")
     p.add_argument("--l-smooth", type=float, default=None, help="Smooth loss weight")
@@ -312,7 +321,8 @@ if __name__ == "__main__":
         "batch_size":    args.bs,
         "learning_rate": args.lr,
         "image_size":    args.img_size,
-        "base_features": args.features,
+        "feature_dim":   args.features,
+        "num_iters":     args.iters,
         "lambda_photo":  args.l_photo,
         "lambda_div":    args.l_div,
         "lambda_smooth": args.l_smooth,

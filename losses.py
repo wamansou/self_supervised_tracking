@@ -154,43 +154,62 @@ def smoothness_loss(flow):
 
 class SelfSupervisedTrackingLoss(nn.Module):
     """
-    L = λ_photo · (α·L_charb + (1-α)·L_ssim) + λ_div · L_div + λ_smooth · L_smooth
+    L = Σ_i  γ^(N-1-i) · [λ_photo·L_photo + λ_div·L_div + λ_smooth·L_smooth]
+
+    Supports both single predictions and iterative refinement sequences.
+    When given a list of predictions (from RAFT), applies exponentially
+    increasing weights so later (more refined) predictions matter more.
 
     Args:
         lambda_photo:  weight for photometric reconstruction
         lambda_div:    weight for zero-divergence (physics) constraint
         lambda_smooth: weight for spatial smoothness regularisation
-        ssim_weight:   blend factor between Charbonnier and SSIM (0 = pure Charbonnier)
+        ssim_weight:   blend factor between Charbonnier and SSIM
+        gamma:         exponential weight decay for iterative loss (default 0.8)
     """
 
     def __init__(self, lambda_photo=1.0, lambda_div=0.5, lambda_smooth=0.1,
-                 ssim_weight=0.5):
+                 ssim_weight=0.5, gamma=0.8):
         super().__init__()
         self.lp = lambda_photo
         self.ld = lambda_div
         self.ls = lambda_smooth
         self.ssim_w = ssim_weight
+        self.gamma = gamma
 
     def forward(self, img1, img2, pred_flow):
         """
         Args:
             img1, img2: [B, 1, H, W]
-            pred_flow:  [B, 2, H, W]
+            pred_flow:  [B, 2, H, W]  OR  list of [B, 2, H, W]
         Returns:
-            total_loss (scalar), loss_dict (for logging)
+            total_loss (scalar), loss_dict (for logging — final iteration only)
         """
-        lp_charb = photometric_loss(img1, img2, pred_flow)
-        lp_ssim = ssim_loss(img1, img2, pred_flow)
-        lp = (1.0 - self.ssim_w) * lp_charb + self.ssim_w * lp_ssim
+        if not isinstance(pred_flow, (list, tuple)):
+            pred_flow = [pred_flow]
 
-        ldv = divergence_loss(pred_flow)
-        ls = smoothness_loss(pred_flow)
+        n = len(pred_flow)
+        total = 0.0
 
-        total = self.lp * lp + self.ld * ldv + self.ls * ls
+        for i, flow in enumerate(pred_flow):
+            w = self.gamma ** (n - 1 - i)
+
+            lp_charb = photometric_loss(img1, img2, flow)
+            lp_ssim = ssim_loss(img1, img2, flow)
+            lp = (1.0 - self.ssim_w) * lp_charb + self.ssim_w * lp_ssim
+
+            ldv = divergence_loss(flow)
+            ls = smoothness_loss(flow)
+
+            total = total + w * (self.lp * lp + self.ld * ldv + self.ls * ls)
+
+            # Keep final-iteration metrics for logging
+            if i == n - 1:
+                last_photo, last_div, last_smooth = lp, ldv, ls
 
         return total, {
             "total": total.item(),
-            "photometric": lp.item(),
-            "divergence": ldv.item(),
-            "smoothness": ls.item(),
+            "photometric": last_photo.item(),
+            "divergence": last_div.item(),
+            "smoothness": last_smooth.item(),
         }

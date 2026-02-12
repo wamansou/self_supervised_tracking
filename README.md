@@ -1,6 +1,20 @@
 # Self-Supervised Particle Tracking
 
-Dense displacement estimation for particle image pairs **without ground-truth labels**, using a U-Net trained with physics-informed self-supervised losses.
+Dense displacement estimation for particle image pairs **without ground-truth labels**, using physics-informed self-supervised losses. The project evolved from a baseline U-Net to a RAFT-style iterative flow estimator, achieving **sub-pixel accuracy (0.31 px EPE)**.
+
+---
+
+## Results Summary
+
+| | U-Net Baseline | RAFT (final) | Improvement |
+|---|---|---|---|
+| **Best EPE** | 0.87 px | **0.31 px** | **2.8×** |
+| Divergence | 0.020 | **0.002** | 10× |
+| Smoothness | 0.085 | **0.006** | 14× |
+| Parameters | 7.8M | 7.1M | — |
+| Relative Error | 10.9% | **3.9%** | — |
+
+*(EPE = End-Point Error; max displacement = 8 px; 256×256 images)*
 
 ---
 
@@ -14,37 +28,51 @@ Traditional cross-correlation methods (e.g. PIV interrogation windows) discretis
 
 ## Neural Network Architecture
 
-We use a **U-Net** (`FlowEstimatorUNet`) — an encoder–decoder with skip connections, well-suited for dense prediction tasks where both local detail and global context matter.
+### V2: RAFT-Style Iterative Flow Estimator (current)
+
+The production model (`FlowEstimatorRAFT`) uses **correlation volumes** and **iterative refinement** — the two key ideas from RAFT (Teed & Deng, ECCV 2020) adapted for particle tracking.
 
 ```
-Input:  [B, 2, H, W]   ← two grayscale particle frames stacked channel-wise
-Output: [B, 2, H, W]   ← per-pixel displacement (u, v) in pixels
+Input:  [B, 2, H, W]         ← two grayscale particle frames stacked channel-wise
+Output: list of [B, 2, H, W] ← per-pixel displacement (u, v), one per refinement iteration
 ```
 
-### Structure
+#### Pipeline
 
-| Stage       | Layers                                  | Output Shape         |
-|-------------|----------------------------------------|----------------------|
-| **Encoder 1** | 2 × (Conv3×3 → BN → LeakyReLU)     | `[B, f, H, W]`      |
-| **Encoder 2** | MaxPool → 2 × (Conv3×3 → BN → LReLU) | `[B, 2f, H/2, W/2]` |
-| **Encoder 3** | MaxPool → 2 × (Conv3×3 → BN → LReLU) | `[B, 4f, H/4, W/4]` |
-| **Encoder 4** | MaxPool → 2 × (Conv3×3 → BN → LReLU) | `[B, 8f, H/8, W/8]` |
-| **Bottleneck** | MaxPool → 2 × (Conv3×3 → BN → LReLU) | `[B, 16f, H/16, W/16]` |
-| **Decoder 4** | ConvTranspose2d ↑ + skip(enc4) → 2×Conv | `[B, 8f, H/8, W/8]` |
-| **Decoder 3** | ConvTranspose2d ↑ + skip(enc3) → 2×Conv | `[B, 4f, H/4, W/4]` |
-| **Decoder 2** | ConvTranspose2d ↑ + skip(enc2) → 2×Conv | `[B, 2f, H/2, W/2]` |
-| **Decoder 1** | ConvTranspose2d ↑ + skip(enc1) → 2×Conv | `[B, f, H, W]`      |
-| **Head**      | Conv1×1                                 | `[B, 2, H, W]`      |
+| Component | Purpose | Output |
+|-----------|---------|--------|
+| **Feature Encoder** | Shared CNN, extracts 1/8-res features per frame | `[B, 256, H/8, W/8]` per frame |
+| **Context Encoder** | Frame-1 CNN, produces GRU initial state + context | `hidden [B,128,H/8,W/8]`, `ctx [B,128,H/8,W/8]` |
+| **Correlation Volume** | All-pairs dot product between frame features + 4-level pyramid | `[B·H/8·W/8, 1, H/8, W/8]` × 4 levels |
+| **Correlation Lookup** | Sample (2r+1)² local neighbourhood at current flow estimate | `[B, 4×81, H/8, W/8]` |
+| **Motion Encoder** | Fuse correlation features + current flow | `[B, 128, H/8, W/8]` |
+| **ConvGRU** | Recurrent update of hidden state | `[B, 128, H/8, W/8]` |
+| **Flow Head** | Predict Δflow residual | `[B, 2, H/8, W/8]` |
+| **Convex Upsampling** | Learned 8× upsampling (sharper than bilinear) | `[B, 2, H, W]` |
 
-With `base_features = 64` (`f = 64`), the deepest feature map has 1024 channels, giving the network sufficient capacity to capture complex flow patterns like vortices.
+The model runs **12 refinement iterations**, progressively correcting the flow estimate. Each iteration detaches the flow gradient (RAFT-style) so only the current update is trained, preventing vanishing gradients through long chains.
+
+#### Why correlation volumes matter
+
+The U-Net had no explicit mechanism to *compare* features between frames — it had to learn matching implicitly from convolutions alone. The correlation volume provides a direct similarity lookup: "at my current flow estimate, how well do features match?" This makes the model's job fundamentally easier and more robust.
+
+### V1: U-Net Baseline (archived in `model_unet.py`)
+
+A 4-level encoder–decoder with skip connections. Single forward pass, no correlation, no iterative refinement. Served as the development baseline.
 
 ---
 
 ## Loss Function
 
-The model is trained **self-supervised** — no ground-truth flow labels are used during training. Instead, three complementary loss terms provide the learning signal:
+The model is trained **self-supervised** — no ground-truth flow labels are used during training. Instead, three complementary loss terms provide the learning signal.
 
-$$\mathcal{L} = \lambda_{\text{photo}} \cdot \mathcal{L}_{\text{photo}} + \lambda_{\text{div}} \cdot \mathcal{L}_{\text{div}} + \lambda_{\text{smooth}} \cdot \mathcal{L}_{\text{smooth}}$$
+### Iterative Sequence Loss
+
+For RAFT's iterative predictions, the loss applies exponentially increasing weights so later (more refined) iterations matter more:
+
+$$\mathcal{L} = \sum_{i=1}^{N} \gamma^{N-i} \left[ \lambda_{\text{photo}} \cdot \mathcal{L}_{\text{photo}}^{(i)} + \lambda_{\text{div}} \cdot \mathcal{L}_{\text{div}}^{(i)} + \lambda_{\text{smooth}} \cdot \mathcal{L}_{\text{smooth}}^{(i)} \right]$$
+
+with $\gamma = 0.8$ so the final iteration has weight 1.0 and the first has weight $0.8^{11} \approx 0.09$.
 
 ### 1. Photometric Loss ($\mathcal{L}_{\text{photo}}$)
 
@@ -82,6 +110,7 @@ Penalises noisy or discontinuous flow fields. Without this, the model can "game"
 | $\lambda_{\text{photo}}$ | 1.0  | Primary learning signal |
 | $\lambda_{\text{div}}$   | 0.3  | Strong enough to enforce physics without dominating |
 | $\lambda_{\text{smooth}}$ | 0.15 | Prevents noisy flow while allowing genuine gradients |
+| $\gamma$                 | 0.8  | Iteration decay — prioritises final refinement |
 
 ---
 
@@ -103,18 +132,18 @@ Particles are rendered as Gaussian blobs (diameter 2–4 px) placed at random po
 
 ## Training Configuration
 
-| Parameter | Value |
-|-----------|-------|
-| Image size | 256 × 256 |
-| Particles per image | 500–2000 |
-| Max displacement | 8 px |
-| Batch size | 64 |
-| Optimiser | Adam (lr=3e-4, weight_decay=1e-5) |
-| Scheduler | Cosine Annealing (80 epochs, η_min = lr × 0.01) |
-| Mixed precision | AMP (FP16 forward, FP32 gradients) |
-| Gradient clipping | Max norm 1.0 |
-| `torch.compile` | Enabled (PyTorch 2.x graph mode) |
-| `cudnn.benchmark` | Enabled (fixed input sizes) |
+| Parameter | U-Net (v1) | RAFT (v2) |
+|-----------|-----------|-----------|
+| Image size | 256 × 256 | 256 × 256 |
+| Particles per image | 500–2000 | 500–2000 |
+| Max displacement | 8 px | 8 px |
+| Batch size | 64 | 16 |
+| Optimiser | Adam | **AdamW** |
+| Learning rate | 3e-4 | **2e-4** |
+| Scheduler | Cosine Annealing (80 ep) | Cosine Annealing (80 ep) |
+| Mixed precision | AMP | AMP |
+| Gradient clipping | Max norm 1.0 | Max norm 1.0 |
+| Refinement iters | — | **12** |
 
 ---
 
@@ -137,13 +166,31 @@ TensorBoard visualisations logged every 2 epochs:
 
 ---
 
-## Key Bugs Found & Fixed
+## Development Timeline & Bugs Fixed
 
-1. **Warp direction reversed** — `grid_sample` performs backward sampling, so the grid must use `grid - flow` (not `+ flow`). The original sign error caused the model to learn the *negative* of the true flow, explaining why predicted arrows pointed opposite to ground truth and EPE grew as photometric loss decreased.
+### Iteration 1: U-Net baseline
+- Initial U-Net with Charbonnier-only photometric loss
+- **Problem:** EPE *rose* from 4.3 → 6.9 while photo loss fell — model matched wrong particles
 
-2. **TensorBoard titles cropped** — `tight_layout(pad=0.5)` was too tight; matplotlib titles were clipped in the rendered buffer. Fixed by increasing pad to 1.5 and adding 0.5″ to figure heights.
+### Iteration 2: SSIM loss + tuned weights
+- Added SSIM loss ($\alpha=0.5$ blend with Charbonnier) to force structural matching
+- Reduced over-regularization ($\lambda_{\text{smooth}}$: 0.1 → 0.02, $\lambda_{\text{div}}$: 0.5 → 0.1)
+- **Problem:** EPE still diverging — predicted flow pointed *opposite* to ground truth
 
-3. **GPU underutilisation** — The particle renderer used a Python for-loop over 500–2000 particles per image. Replaced with a vectorised separable-Gaussian matmul, added persistent DataLoader workers with prefetching, `torch.compile`, and `cudnn.benchmark`.
+### Iteration 3: Warp direction bug fix
+- **Root cause:** `grid_sample` performs backward sampling, requiring `grid - flow`, not `grid + flow`
+- Model had been forced to learn $\text{pred} \approx -\text{gt}$ to minimize photometric loss
+- After fix: EPE dropped from 4.3 → **0.87 px** with U-Net
+
+### Iteration 4: RAFT architecture
+- Replaced U-Net with RAFT-style model: correlation volumes + ConvGRU iterative refinement
+- Added sequence loss with $\gamma=0.8$ exponential weighting
+- Switched to AdamW optimiser
+- **Result:** EPE **0.87 → 0.31 px** (2.8× improvement)
+
+### Other fixes
+- **TensorBoard titles cropped** — increased `tight_layout` padding and figure heights
+- **GPU at 54% utilisation** — vectorised particle rendering (separable Gaussian matmul), persistent DataLoader workers, `cudnn.benchmark`, increased batch size
 
 ---
 
@@ -154,7 +201,7 @@ TensorBoard visualisations logged every 2 epochs:
 python train.py
 
 # Custom settings
-python train.py --epochs 100 --bs 32 --lr 1e-4 --l-smooth 0.2
+python train.py --epochs 100 --bs 8 --lr 1e-4 --iters 16
 
 # Resume from checkpoint
 python train.py --resume checkpoints/checkpoint_epoch_40.pth
@@ -171,7 +218,8 @@ tensorboard --logdir runs/
 ## Project Structure
 
 ```
-├── model.py            # U-Net architecture (FlowEstimatorUNet)
+├── model.py            # RAFT-style flow estimator (FlowEstimatorRAFT)
+├── model_unet.py       # U-Net baseline (FlowEstimatorUNet, archived)
 ├── losses.py           # Self-supervised losses (photometric, SSIM, divergence, smoothness)
 ├── data_generator.py   # Synthetic particle image pair generator
 ├── train.py            # Training loop with AMP, logging, checkpointing
