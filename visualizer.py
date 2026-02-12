@@ -123,12 +123,12 @@ class TrainingVisualizer:
     # ---- 1) Frame pair ----
 
     def _log_frame_pair(self, epoch, tag, img1, img2):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4), facecolor="black")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4.5), facecolor="black")
         for ax, im, title in [(ax1, img1, "Frame 1"), (ax2, img2, "Frame 2")]:
             ax.imshow(im.cpu().numpy(), cmap="inferno", vmin=0, vmax=1)
             ax.set_title(title, color="white", fontsize=10)
             ax.axis("off")
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=1.5)
         self.writer.add_image(f"{tag}/1_frames", self._fig_to_tensor(fig), epoch)
 
     # ---- 2) HSV flow colour wheel ----
@@ -156,14 +156,14 @@ class TrainingVisualizer:
         pred_rgb = self._flow_to_hsv(pred)
         gt_rgb = self._flow_to_hsv(gt)
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4), facecolor="black")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4.5), facecolor="black")
         ax1.imshow(pred_rgb)
         ax1.set_title("Predicted flow", color="white", fontsize=10)
         ax1.axis("off")
         ax2.imshow(gt_rgb)
         ax2.set_title("Ground truth flow", color="white", fontsize=10)
         ax2.axis("off")
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=1.5)
         self.writer.add_image(f"{tag}/2_flow_hsv", self._fig_to_tensor(fig), epoch)
 
     # ---- 3) Quiver plot ----
@@ -178,7 +178,7 @@ class TrainingVisualizer:
         gu = gt[0].cpu().numpy()[::step, ::step]
         gv = gt[1].cpu().numpy()[::step, ::step]
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5), facecolor="black")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5.5), facecolor="black")
 
         for ax, u, v, title in [
             (ax1, pu, pv, "Predicted"),
@@ -193,7 +193,7 @@ class TrainingVisualizer:
             ax.set_title(title, color="white", fontsize=10)
             ax.axis("off")
 
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=1.5)
         self.writer.add_image(f"{tag}/3_quiver", self._fig_to_tensor(fig), epoch)
 
     # ---- 4) Warp quality ----
@@ -206,7 +206,7 @@ class TrainingVisualizer:
 
         diff = (warped - img2).abs().cpu().numpy()
 
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4), facecolor="black")
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4.5), facecolor="black")
         titles = ["Warped frame 1", "Frame 2 (target)", "|Warp − Target|"]
         imgs = [warped.cpu().numpy(), img2.cpu().numpy(), diff]
         cmaps = ["inferno", "inferno", "magma"]
@@ -216,7 +216,7 @@ class TrainingVisualizer:
             ax.set_title(t, color="white", fontsize=10)
             ax.axis("off")
 
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=1.5)
         self.writer.add_image(f"{tag}/4_warp_quality", self._fig_to_tensor(fig), epoch)
 
     # ---- 5) Error & divergence ----
@@ -232,7 +232,7 @@ class TrainingVisualizer:
         dv_dy = dv_dy[:, :, :, 1:-1]
         div = (du_dx + dv_dy).squeeze().cpu().numpy()
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4), facecolor="black")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), facecolor="black")
 
         im1 = ax1.imshow(epe, cmap="hot")
         ax1.set_title(f"EPE  (mean {epe.mean():.2f} px)", color="white", fontsize=10)
@@ -245,5 +245,5 @@ class TrainingVisualizer:
         ax2.axis("off")
         fig.colorbar(im2, ax=ax2, fraction=0.046)
 
-        fig.tight_layout(pad=0.5)
+        fig.tight_layout(pad=1.5)
         self.writer.add_image(f"{tag}/5_error_div", self._fig_to_tensor(fig), epoch)

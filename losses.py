@@ -43,7 +43,7 @@ def warp_image(image, flow):
         [flow[:, 0] / (W / 2), flow[:, 1] / (H / 2)], dim=-1
     )  # [B, H, W, 2]
 
-    sample_grid = grid + flow_norm
+    sample_grid = grid - flow_norm
     return F.grid_sample(
         image, sample_grid, mode="bilinear", padding_mode="border", align_corners=True
     )
@@ -70,6 +70,50 @@ def photometric_loss(img1, img2, flow, method="charbonnier"):
         eps = 1e-6
         return torch.sqrt(diff ** 2 + eps).mean()
     raise ValueError(f"Unknown method: {method}")
+
+
+def _gaussian_window(window_size, sigma=1.5):
+    """Create a 2D Gaussian kernel for SSIM computation."""
+    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    window = g.unsqueeze(1) * g.unsqueeze(0)          # [ws, ws]
+    return window.unsqueeze(0).unsqueeze(0)             # [1, 1, ws, ws]
+
+
+def ssim_loss(img1, img2, flow, window_size=11):
+    """
+    Structural-Similarity (SSIM) based photometric loss.
+
+    More robust than pixel-wise losses for particle images because it
+    compares *local structure* (edges, patterns) rather than raw intensity,
+    avoiding local-minima where the model matches the wrong particles.
+
+    Returns  1 − mean(SSIM)  so that 0 = perfect match.
+    """
+    warped = warp_image(img1, flow)
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    pad = window_size // 2
+
+    window = _gaussian_window(window_size).to(img1.device, img1.dtype)
+
+    mu1 = F.conv2d(warped, window, padding=pad)
+    mu2 = F.conv2d(img2, window, padding=pad)
+
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(warped ** 2, window, padding=pad) - mu1_sq
+    sigma2_sq = F.conv2d(img2 ** 2, window, padding=pad) - mu2_sq
+    sigma12 = F.conv2d(warped * img2, window, padding=pad) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return 1.0 - ssim_map.mean()
 
 
 def divergence_loss(flow):
@@ -110,19 +154,22 @@ def smoothness_loss(flow):
 
 class SelfSupervisedTrackingLoss(nn.Module):
     """
-    L = λ_photo · L_photo  +  λ_div · L_div  +  λ_smooth · L_smooth
+    L = λ_photo · (α·L_charb + (1-α)·L_ssim) + λ_div · L_div + λ_smooth · L_smooth
 
     Args:
         lambda_photo:  weight for photometric reconstruction
         lambda_div:    weight for zero-divergence (physics) constraint
         lambda_smooth: weight for spatial smoothness regularisation
+        ssim_weight:   blend factor between Charbonnier and SSIM (0 = pure Charbonnier)
     """
 
-    def __init__(self, lambda_photo=1.0, lambda_div=0.5, lambda_smooth=0.1):
+    def __init__(self, lambda_photo=1.0, lambda_div=0.5, lambda_smooth=0.1,
+                 ssim_weight=0.5):
         super().__init__()
         self.lp = lambda_photo
         self.ld = lambda_div
         self.ls = lambda_smooth
+        self.ssim_w = ssim_weight
 
     def forward(self, img1, img2, pred_flow):
         """
@@ -132,7 +179,10 @@ class SelfSupervisedTrackingLoss(nn.Module):
         Returns:
             total_loss (scalar), loss_dict (for logging)
         """
-        lp = photometric_loss(img1, img2, pred_flow)
+        lp_charb = photometric_loss(img1, img2, pred_flow)
+        lp_ssim = ssim_loss(img1, img2, pred_flow)
+        lp = (1.0 - self.ssim_w) * lp_charb + self.ssim_w * lp_ssim
+
         ldv = divergence_loss(pred_flow)
         ls = smoothness_loss(pred_flow)
 

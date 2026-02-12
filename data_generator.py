@@ -122,6 +122,11 @@ class SyntheticParticleDataset(Dataset):
         """
         Render a particle image as a sum of Gaussian blobs.
 
+        Uses the separable-Gaussian trick: each 2-D Gaussian is the outer
+        product of two 1-D Gaussians, so the sum over N particles becomes
+        a single [S, N] @ [N, S] matrix multiply — orders of magnitude
+        faster than a Python loop over N particles.
+
         Args:
             positions: [N, 2] (x, y) in pixel coords
             diameters: [N] particle diameters in pixels
@@ -129,31 +134,23 @@ class SyntheticParticleDataset(Dataset):
             image: [H, W] float tensor in [0, 1]
         """
         S = self.image_size
-        image = torch.zeros(S, S)
+        coords = torch.arange(S, dtype=torch.float32)   # [S]
 
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(S, dtype=torch.float32),
-            torch.arange(S, dtype=torch.float32),
-            indexing="ij",
-        )
+        px = positions[:, 0]          # [N]
+        py = positions[:, 1]          # [N]
+        sigma = diameters / 4.0       # [N]
+        inv_2s2 = 1.0 / (2.0 * sigma ** 2)              # [N]
 
-        for i in range(len(positions)):
-            px, py = positions[i, 0].item(), positions[i, 1].item()
-            sigma = diameters[i].item() / 4.0
+        # 1-D Gaussian components  — [S, N]
+        gx = torch.exp(-(coords.unsqueeze(1) - px.unsqueeze(0)) ** 2 * inv_2s2.unsqueeze(0))
+        gy = torch.exp(-(coords.unsqueeze(1) - py.unsqueeze(0)) ** 2 * inv_2s2.unsqueeze(0))
 
-            r_max = int(3 * sigma) + 1
-            x0, x1 = max(0, int(px) - r_max), min(S, int(px) + r_max + 1)
-            y0, y1 = max(0, int(py) - r_max), min(S, int(py) + r_max + 1)
-            if x0 >= x1 or y0 >= y1:
-                continue
+        # Sum of outer products via matmul: image[y, x] = Σ_n gy[y,n]·gx[x,n]
+        image = gy @ gx.t()           # [S, S]
 
-            lx = x_grid[y0:y1, x0:x1]
-            ly = y_grid[y0:y1, x0:x1]
-            blob = torch.exp(-((lx - px) ** 2 + (ly - py) ** 2) / (2 * sigma ** 2))
-            image[y0:y1, x0:x1] += blob
-
-        if image.max() > 0:
-            image = image / image.max()
+        mx = image.max()
+        if mx > 0:
+            image = image / mx
         return image
 
     # ------------------------------------------------------------------
@@ -177,13 +174,13 @@ class SyntheticParticleDataset(Dataset):
             + self.particle_diameter_range[0]
         )
 
-        # Displace particles according to flow field
+        # Displace particles according to flow field (vectorised)
+        S = self.image_size
+        ix = positions1[:, 0].clamp(0, S - 1).long()   # [N]
+        iy = positions1[:, 1].clamp(0, S - 1).long()   # [N]
         positions2 = positions1.clone()
-        for i in range(n):
-            ix = int(positions1[i, 0].clamp(0, self.image_size - 1))
-            iy = int(positions1[i, 1].clamp(0, self.image_size - 1))
-            positions2[i, 0] += flow[0, iy, ix]
-            positions2[i, 1] += flow[1, iy, ix]
+        positions2[:, 0] += flow[0, iy, ix]
+        positions2[:, 1] += flow[1, iy, ix]
 
         # Render
         img1 = self._render_particles(positions1, diameters)

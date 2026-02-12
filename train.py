@@ -28,27 +28,29 @@ from visualizer import TrainingVisualizer
 
 DEFAULT_CONFIG = {
     # ----- Data -----
-    "num_train_samples": 2000,
-    "num_val_samples": 200,
+    "num_train_samples": 4000,
+    "num_val_samples": 400,
     "image_size": 256,
     "num_particles_range": [500, 2000],
     "noise_level": 0.05,
     "max_displacement": 8.0,
     # ----- Model -----
-    "base_features": 32,
+    "base_features": 64,
     # ----- Loss weights -----
     "lambda_photo": 1.0,
-    "lambda_div": 0.5,
-    "lambda_smooth": 0.1,
+    "lambda_div": 0.3,
+    "lambda_smooth": 0.15,
+    "ssim_weight": 0.5,
     # ----- Optimiser -----
-    "batch_size": 8,
-    "num_epochs": 50,
-    "learning_rate": 1e-3,
+    "batch_size": 64,
+    "num_epochs": 80,
+    "learning_rate": 3e-4,
     "weight_decay": 1e-5,
     # ----- Misc -----
-    "num_workers": 4,
+    "num_workers": 8,
     "save_every": 10,
     "output_dir": "checkpoints",
+    "use_amp": True,
     # ----- Visualisation -----
     "viz_every": 2,       # log images to TensorBoard every N epochs
     "viz_samples": 3,     # how many samples to visualise per epoch
@@ -75,14 +77,28 @@ def train(cfg):
     train_ds = SyntheticParticleDataset(num_samples=cfg["num_train_samples"], **common)
     val_ds   = SyntheticParticleDataset(num_samples=cfg["num_val_samples"],   **common)
 
+    _persistent = cfg["num_workers"] > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["batch_size"],
         shuffle=True,
         num_workers=cfg["num_workers"],
         pin_memory=True,
+        persistent_workers=_persistent,
+        prefetch_factor=4 if _persistent else None,
     )
-    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], num_workers=0)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg["batch_size"],
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        persistent_workers=_persistent,
+        prefetch_factor=4 if _persistent else None,
+    )
+
+    # ---- cuDNN benchmark (fixed input sizes → pick fastest kernels) ----
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # ---- Model ----
     model = FlowEstimatorUNet(
@@ -91,9 +107,15 @@ def train(cfg):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_params:,}")
 
+    # ---- torch.compile (PyTorch 2.x graph-mode speedup) ----
+    if hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("torch.compile enabled")
+
     # ---- Loss / Optimiser / Scheduler ----
     criterion = SelfSupervisedTrackingLoss(
-        cfg["lambda_photo"], cfg["lambda_div"], cfg["lambda_smooth"]
+        cfg["lambda_photo"], cfg["lambda_div"], cfg["lambda_smooth"],
+        ssim_weight=cfg["ssim_weight"],
     )
     optimizer = optim.Adam(
         model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"]
@@ -101,6 +123,10 @@ def train(cfg):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["num_epochs"], eta_min=cfg["learning_rate"] * 0.01
     )
+
+    # ---- AMP (mixed precision) ----
+    use_amp = cfg.get("use_amp", False) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     # ---- Resume support ----
     start_epoch = 1
@@ -120,6 +146,8 @@ def train(cfg):
         num_samples=cfg["viz_samples"],
     )
     print(f"TensorBoard → {cfg['log_dir']}  (log images every {cfg['viz_every']} epochs)")
+    if use_amp:
+        print("Mixed-precision training (AMP) enabled")
 
     # ---- Logging ----
     history = {"train": [], "val": []}
@@ -140,13 +168,21 @@ def train(cfg):
             images = images.to(device)
             img1, img2 = images[:, 0:1], images[:, 1:2]
 
-            pred = model(images)
-            loss, ld = criterion(img1, img2, pred)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred = model(images)
+                loss, ld = criterion(img1, img2, pred)
 
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             for k in tr:
                 tr[k] += ld[k]
@@ -166,8 +202,9 @@ def train(cfg):
                 gt_flow = gt_flow.to(device)
                 img1, img2 = images[:, 0:1], images[:, 1:2]
 
-                pred = model(images)
-                loss, ld = criterion(img1, img2, pred)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    pred = model(images)
+                    loss, ld = criterion(img1, img2, pred)
 
                 for k in va:
                     va[k] += ld[k]
@@ -257,6 +294,8 @@ def parse_args():
     p.add_argument("--l-photo",  type=float, default=None, help="Photo loss weight")
     p.add_argument("--l-div",    type=float, default=None, help="Div loss weight")
     p.add_argument("--l-smooth", type=float, default=None, help="Smooth loss weight")
+    p.add_argument("--ssim-w",   type=float, default=None, help="SSIM blend weight (0=pure Charbonnier, 1=pure SSIM)")
+    p.add_argument("--no-amp",   action="store_true",       help="Disable mixed-precision training")
     p.add_argument("--resume",    type=str,   default=None, help="Checkpoint to resume")
     p.add_argument("--out",       type=str,   default=None, help="Output directory")
     p.add_argument("--viz-every", type=int,   default=None, help="Log images every N epochs")
@@ -277,11 +316,14 @@ if __name__ == "__main__":
         "lambda_photo":  args.l_photo,
         "lambda_div":    args.l_div,
         "lambda_smooth": args.l_smooth,
+        "ssim_weight":   args.ssim_w,
         "resume":        args.resume,
         "output_dir":    args.out,
         "viz_every":     args.viz_every,
         "log_dir":       args.log_dir,
     }
+    if args.no_amp:
+        cfg["use_amp"] = False
     for k, v in overrides.items():
         if v is not None:
             cfg[k] = v
