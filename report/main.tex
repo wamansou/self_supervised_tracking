@@ -1,0 +1,430 @@
+\documentclass[11pt, a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage[backend=biber, style=numeric, sorting=nyt]{biblatex}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage{bm}
+
+\addbibresource{references.bib}
+\graphicspath{{../figures/}}
+
+% ── Macros ────────────────────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\pd}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\vect}[1]{\bm{#1}}
+
+% ── Title ─────────────────────────────────────────────────────────
+\title{Self-Supervised Dense Displacement Estimation\\for Particle Image Velocimetry\\Using Iterative Refinement}
+\author{Wael Mansour\\[4pt]
+\textit{Mathematical Project}\\
+\textit{Bachelor's Programme}}
+\date{\today}
+
+% ══════════════════════════════════════════════════════════════════
+\begin{document}
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────────
+\begin{abstract}
+Particle Image Velocimetry (PIV) is a widely used experimental technique for measuring fluid velocity fields by tracking tracer particles between consecutive image frames.
+Traditional correlation-based PIV methods discretise the domain into coarse interrogation windows, limiting spatial resolution.
+In this project, I develop a deep learning approach that estimates \emph{dense, per-pixel} displacement fields from synthetic particle image pairs without requiring ground-truth flow labels during training.
+The method uses a self-supervised loss composed of a photometric reconstruction term, a divergence-free physics constraint, and a spatial smoothness regulariser.
+I implement and compare two architectures: a U-Net baseline and a RAFT-style iterative flow estimator based on correlation volumes and a convolutional gated recurrent unit.
+The RAFT model achieves a mean end-point error of 0.31\,px on synthetic test flows---a $2.8\times$ improvement over the U-Net baseline (0.87\,px)---demonstrating that iterative refinement with explicit feature matching significantly outperforms single-pass regression for this task.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Measuring fluid velocity fields is fundamental to experimental fluid mechanics, climate modelling, biomedical flow analysis, and industrial process control.
+Particle Image Velocimetry (PIV) achieves this by seeding a fluid with small tracer particles, illuminating them with a laser sheet, and capturing two consecutive images separated by a known time interval~\cite{adrian2011particle}.
+The displacement of each particle between frames, divided by the time step, yields a local velocity measurement.
+
+Classical PIV algorithms divide the image into interrogation windows (typically $32 \times 32$ or $64 \times 64$ pixels) and compute cross-correlations to find the most likely displacement within each window.
+While robust, this approach inherently limits spatial resolution to the window size and struggles with strong velocity gradients within a single window.
+
+Optical flow methods from computer vision offer a per-pixel alternative.
+The seminal work of Horn and Schunck~\cite{horn1981determining} formulated optical flow estimation as a variational problem: minimise the brightness constancy residual subject to a global smoothness constraint.
+Lucas and Kanade~\cite{lucas1981iterative} proposed a local, window-based variant that is more robust to noise but, like classical PIV, sacrifices resolution.
+More recently, deep learning approaches---beginning with FlowNet~\cite{dosovitskiy2015flownet} and refined through PWC-Net~\cite{sun2018pwcnet} and RAFT~\cite{teed2020raft}---have achieved state-of-the-art accuracy on natural image benchmarks by learning to predict optical flow end-to-end.
+
+A key challenge in applying deep learning to PIV is the scarcity of labelled data: obtaining pixel-accurate ground-truth displacement fields for real experimental images is impractical.
+Self-supervised (also called unsupervised) optical flow methods address this by training with proxy losses that do not require ground truth~\cite{jason2016back, meister2018unflow}.
+The core idea is that if the predicted flow is correct, then warping frame~1 by the predicted displacement should reconstruct frame~2.
+
+In this project, I combine self-supervised training with physics-informed regularisation to estimate dense displacement fields for PIV.
+I use synthetically generated particle images with parametric flow fields, enabling controlled evaluation against known ground truth.
+I implement and compare two neural network architectures:
+\begin{enumerate}
+    \item A \textbf{U-Net} encoder--decoder baseline~\cite{ronneberger2015unet}, which predicts flow in a single forward pass.
+    \item A \textbf{RAFT-style iterative estimator}~\cite{teed2020raft}, which builds a correlation volume between frame features and refines the flow over 12 iterations using a convolutional GRU.
+\end{enumerate}
+The RAFT model achieves a mean end-point error of 0.31\,px, compared to 0.87\,px for the U-Net---demonstrating the value of iterative refinement and explicit feature matching for particle tracking.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Background}
+\label{sec:background}
+
+\subsection{Optical Flow and the Brightness Constancy Assumption}
+
+Optical flow is the apparent motion of intensity patterns between two images.
+Given a grayscale image $I(\vect{x}, t)$ where $\vect{x} = (x, y)$ denotes spatial position and $t$ denotes time, the \emph{brightness constancy assumption} states that the intensity of a moving point does not change:
+\begin{equation}
+    I(\vect{x}, t) = I(\vect{x} + \vect{d}, t + \Delta t),
+    \label{eq:bca}
+\end{equation}
+where $\vect{d} = (u, v)$ is the displacement vector.
+A first-order Taylor expansion of the right-hand side yields the \emph{optical flow constraint equation}:
+\begin{equation}
+    \pd{I}{x}\, u + \pd{I}{y}\, v + \pd{I}{t} = 0.
+    \label{eq:ofce}
+\end{equation}
+This is a single equation in two unknowns, making the problem ill-posed without additional constraints.
+
+Horn and Schunck~\cite{horn1981determining} resolved this by introducing a global smoothness regulariser, formulating the estimation as a variational problem:
+\begin{equation}
+    \min_{\vect{d}} \int_\Omega \left[ \left( \pd{I}{x} u + \pd{I}{y} v + \pd{I}{t} \right)^2 + \alpha \left( \norm{\nabla u}^2 + \norm{\nabla v}^2 \right) \right] d\vect{x},
+    \label{eq:horn_schunck}
+\end{equation}
+where $\alpha > 0$ controls the trade-off between data fidelity and smoothness.
+This variational perspective---balancing a data term with a regulariser---directly informs the loss function design in this project.
+
+\subsection{Deep Learning for Optical Flow}
+
+FlowNet~\cite{dosovitskiy2015flownet} was the first end-to-end convolutional neural network for optical flow, introducing the idea of learning flow prediction directly from image pairs.
+PWC-Net~\cite{sun2018pwcnet} improved upon this with a coarse-to-fine pyramid, learnable feature warping, and cost volumes.
+RAFT~\cite{teed2020raft} represented a paradigm shift: rather than coarse-to-fine refinement across pyramid levels, RAFT operates at a single resolution ($1/8$) and uses \emph{iterative updates} via a recurrent unit to progressively refine the flow estimate.
+
+The key components of RAFT that I adapt for particle tracking are:
+\begin{itemize}
+    \item \textbf{Correlation volumes.} An all-pairs dot product between feature maps of the two frames yields a 4D tensor encoding the visual similarity between every pair of spatial locations. A multi-scale pyramid built by average-pooling allows capturing both fine and coarse displacements.
+    \item \textbf{Iterative refinement.} A convolutional Gated Recurrent Unit (GRU)~\cite{cho2014gru} maintains a hidden state and updates the flow estimate by a learned residual at each iteration. Crucially, the flow gradient is \emph{detached} between iterations, so only the current residual is trained---preventing vanishing gradients through long iteration chains.
+    \item \textbf{Convex upsampling.} Rather than bilinear interpolation, RAFT predicts a convex combination of neighbouring low-resolution flow values to upsample from $1/8$ to full resolution, producing sharper flow boundaries.
+\end{itemize}
+
+\subsection{Self-Supervised Optical Flow}
+
+Supervised optical flow methods require ground-truth displacement fields, which are expensive or impossible to obtain for real-world images.
+Self-supervised approaches replace the supervised loss with a photometric reconstruction objective: warp frame~1 by the predicted flow and penalise the difference with frame~2~\cite{jason2016back, meister2018unflow}.
+This approach works because a correct flow field, by definition, maps pixels in frame~1 to their corresponding locations in frame~2.
+
+For PIV applications, I augment the photometric loss with physics-informed constraints. Since many flows of interest (e.g., low-speed liquid flows) satisfy the incompressibility condition $\nabla \cdot \vect{u} = 0$, I include a divergence penalty. This is a concrete example of embedding domain knowledge into a learning framework---a theme central to modern scientific computing.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Synthetic Data Generation}
+\label{sec:data}
+
+All training and evaluation data are generated synthetically, enabling controlled experiments with exact ground truth.
+Each sample consists of a pair of $256 \times 256$ grayscale particle images and a corresponding dense displacement field $\vect{d}(x,y) = (u, v) \in \R^{2 \times 256 \times 256}$.
+
+\paragraph{Particle rendering.}
+For each sample, $N \in [500, 2000]$ particles are placed at random positions $\{\vect{p}_i\}_{i=1}^{N}$ with random diameters $d_i \in [2, 4]$~pixels.
+Each particle is modelled as a 2D Gaussian blob.
+Rather than rendering particles one-by-one in a loop, I exploit the separability of the Gaussian kernel: the contribution of particle $i$ to pixel $(x, y)$ is
+\begin{equation}
+    G_i(x, y) = \exp\!\left(-\frac{(x - p_{i,x})^2}{2\sigma_i^2}\right) \cdot \exp\!\left(-\frac{(y - p_{i,y})^2}{2\sigma_i^2}\right),
+    \label{eq:gaussian_sep}
+\end{equation}
+where $\sigma_i = d_i / 4$.
+Defining the matrices $(\vect{G}_x)_{j,i} = \exp\!\big(-\!(j - p_{i,x})^2 / (2\sigma_i^2)\big)$ and $(\vect{G}_y)_{j,i}$ analogously, the full image is
+\begin{equation}
+    \vect{I} = \vect{G}_y \, \vect{G}_x^\top \in \R^{256 \times 256},
+    \label{eq:matmul_render}
+\end{equation}
+which sums over all $N$ particles via a single matrix multiplication---orders of magnitude faster than a Python loop.
+After rendering, Gaussian sensor noise ($\sigma = 0.05$) is added and pixel values are clamped to $[0, 1]$.
+
+\paragraph{Flow fields.}
+I use five parametric flow types with randomised parameters to ensure diversity:
+\begin{enumerate}
+    \item \textbf{Lamb--Oseen vortex:} a classical viscous vortex model~\cite{lamb1932hydrodynamics} with tangential velocity
+    \begin{equation}
+        v_\theta(r) = \frac{\Gamma}{2\pi r}\left(1 - \exp\!\left(-\frac{r^2}{r_0^2}\right)\right),
+        \label{eq:lamb_oseen}
+    \end{equation}
+    where $\Gamma$ is the circulation, $r_0$ is the core radius, and $r$ is the distance from the vortex centre.
+    \item \textbf{Uniform translation:} constant displacement $(u, v) = m(\cos\theta, \sin\theta)$ at a random angle $\theta$ and magnitude $m$.
+    \item \textbf{Linear shear:} $u = a(y - 0.5)$, $v = 0$ (or transposed), modelling a linear velocity profile.
+    \item \textbf{Channel (Poiseuille) flow:} a parabolic profile $u = a \cdot 4y(1-y)$, $v = 0$, representing fully developed laminar pipe flow.
+    \item \textbf{Multi-vortex:} superposition of 2--5 Lamb--Oseen vortices with independent random parameters and signs.
+\end{enumerate}
+All flow magnitudes are bounded by a maximum displacement of 8~pixels ($\approx 3\%$ of the image width).
+Frame~2 is generated by displacing each particle according to the flow field at its position in frame~1, then re-rendering.
+
+\subsection{Self-Supervised Loss Function}
+\label{sec:loss}
+
+The total loss combines three terms, none of which requires ground-truth flow.
+
+\paragraph{Photometric loss.}
+Given the predicted flow $\hat{\vect{d}}$, frame~1 is warped via differentiable bilinear sampling (backward warping):
+\begin{equation}
+    \tilde{I}_1(\vect{q}) = I_1\!\left(\vect{q} - \hat{\vect{d}}(\vect{q})\right),
+    \label{eq:warp}
+\end{equation}
+where $\vect{q}$ is a pixel coordinate in frame~2 and the sampling uses \texttt{grid\_sample} with bilinear interpolation.
+Note the subtraction: the flow is defined \emph{forward} (frame~1 $\to$ frame~2), so backward warping requires $\vect{q} - \hat{\vect{d}}$.
+
+The photometric loss blends two complementary terms:
+\begin{equation}
+    \mathcal{L}_\text{photo} = (1 - \alpha)\, \mathcal{L}_\text{Charb} + \alpha\, \mathcal{L}_\text{SSIM},
+    \label{eq:photo_blend}
+\end{equation}
+with $\alpha = 0.5$.
+The Charbonnier penalty~\cite{charbonnier1994two}
+\begin{equation}
+    \mathcal{L}_\text{Charb} = \frac{1}{|\Omega|} \sum_{\vect{q} \in \Omega} \sqrt{\left(\tilde{I}_1(\vect{q}) - I_2(\vect{q})\right)^2 + \epsilon}
+    \label{eq:charbonnier}
+\end{equation}
+(with $\epsilon = 10^{-6}$) is a robust approximation to $L^1$ that is differentiable at zero.
+The Structural Similarity (SSIM) loss~\cite{wang2004image}
+\begin{equation}
+    \mathcal{L}_\text{SSIM} = 1 - \text{SSIM}(\tilde{I}_1, I_2)
+    \label{eq:ssim}
+\end{equation}
+compares local luminance, contrast, and correlation within a Gaussian-weighted window, making it sensitive to \emph{structural} differences rather than raw pixel values.
+This is important for particle images where many particles appear visually similar: pixel-wise losses alone can converge to local minima that match the wrong particle, while SSIM enforces consistency of the local neighbourhood structure.
+
+\paragraph{Divergence loss.}
+For incompressible flows, the velocity field must satisfy the continuity equation $\nabla \cdot \vect{u} = 0$, or equivalently:
+\begin{equation}
+    \pd{u}{x} + \pd{v}{y} = 0.
+    \label{eq:divergence}
+\end{equation}
+I penalise deviations from this constraint using central finite differences on the interior pixels:
+\begin{equation}
+    \mathcal{L}_\text{div} = \frac{1}{|\Omega'|} \sum_{\vect{q} \in \Omega'} \left( \pd{\hat{u}}{x}\bigg|_{\vect{q}} + \pd{\hat{v}}{y}\bigg|_{\vect{q}} \right)^2,
+    \label{eq:div_loss}
+\end{equation}
+where $\Omega'$ is the set of interior pixels (excluding boundaries where central differences are undefined).
+This physics prior prevents the model from predicting non-physical flows containing sources or sinks.
+
+\paragraph{Smoothness loss.}
+A total-variation-style regulariser penalises large spatial gradients of the flow:
+\begin{equation}
+    \mathcal{L}_\text{smooth} = \frac{1}{|\Omega|} \sum_{\vect{q}} \left[ \left(\pd{\hat{\vect{d}}}{x}\right)^2 + \left(\pd{\hat{\vect{d}}}{y}\right)^2 \right]_{\vect{q}}.
+    \label{eq:smooth_loss}
+\end{equation}
+This prevents noisy, spatially incoherent flow predictions that could ``game'' the photometric loss by matching individual particles through irregular displacements.
+The connection to the Horn--Schunck regulariser in \cref{eq:horn_schunck} is direct: both penalise $\|\nabla u\|^2 + \|\nabla v\|^2$.
+
+\paragraph{Iterative sequence loss.}
+For the RAFT model, which produces a flow prediction $\hat{\vect{d}}^{(i)}$ at each iteration $i = 1, \ldots, N$ (with $N=12$), the losses are summed with exponentially increasing weights so that later (more refined) predictions contribute more:
+\begin{equation}
+    \mathcal{L} = \sum_{i=1}^{N} \gamma^{N-i} \left[ \lambda_\text{photo}\, \mathcal{L}_\text{photo}^{(i)} + \lambda_\text{div}\, \mathcal{L}_\text{div}^{(i)} + \lambda_\text{smooth}\, \mathcal{L}_\text{smooth}^{(i)} \right],
+    \label{eq:total_loss}
+\end{equation}
+with $\gamma = 0.8$, $\lambda_\text{photo} = 1.0$, $\lambda_\text{div} = 0.3$, and $\lambda_\text{smooth} = 0.15$.
+The final iteration has weight~1.0, while the first has weight $0.8^{11} \approx 0.09$.
+
+\subsection{Model Architecture}
+\label{sec:architecture}
+
+\paragraph{U-Net baseline.}
+The baseline is a 4-level U-Net encoder--decoder~\cite{ronneberger2015unet} with skip connections.
+It takes the two-frame input $[B, 2, 256, 256]$ and outputs a single flow prediction $[B, 2, 256, 256]$ in one forward pass.
+With 7.8M trainable parameters, the U-Net has no mechanism for explicit feature matching between frames---it must learn to compare them implicitly through convolutions.
+
+\paragraph{RAFT-style iterative estimator.}
+The main model, \texttt{FlowEstimatorRAFT}, adapts the RAFT architecture~\cite{teed2020raft} to single-channel particle images.
+It has 7.1M parameters and operates as follows:
+
+\begin{enumerate}
+    \item \textbf{Feature extraction.}
+    A shared \emph{FeatureEncoder} (residual CNN with InstanceNorm) processes each frame independently to produce feature maps at $1/8$ resolution: $\vect{F}_k \in \R^{B \times 256 \times 32 \times 32}$ for $k \in \{1, 2\}$.
+    A separate \emph{ContextEncoder} processes frame~1 to produce a GRU hidden state $\vect{h}_0 \in \R^{B \times 128 \times 32 \times 32}$ and context features $\vect{c} \in \R^{B \times 128 \times 32 \times 32}$.
+
+    \item \textbf{Correlation volume.}
+    The all-pairs correlation between the two feature maps is computed as:
+    \begin{equation}
+        C_{ij} = \frac{1}{\sqrt{D}} \sum_{d=1}^{D} F_{1}^{(d)}(i)\, F_{2}^{(d)}(j),
+        \label{eq:corr}
+    \end{equation}
+    where $D = 256$ is the feature dimension and $i, j$ index spatial locations.
+    This 4D volume is pooled into a 4-level pyramid (successive $2\times$ average pooling), enabling the model to match features at multiple scales.
+    At each iteration, a local $(2r+1)^2$ neighbourhood (with $r=4$, so 81 values) is sampled from each pyramid level at the current flow estimate, yielding $4 \times 81 = 324$ correlation features per pixel.
+
+    \item \textbf{Iterative refinement.}
+    A \emph{MotionEncoder} fuses the correlation lookup with the current flow estimate into motion features.
+    These, combined with the context features $\vect{c}$, are fed to a \emph{convolutional GRU}~\cite{cho2014gru} that updates the hidden state:
+    \begin{equation}
+        \vect{h}_{t} = (1 - \vect{z}_t) \odot \vect{h}_{t-1} + \vect{z}_t \odot \tilde{\vect{h}}_t,
+        \label{eq:gru}
+    \end{equation}
+    where $\vect{z}_t$ is the update gate and $\tilde{\vect{h}}_t$ is the candidate state.
+    A \emph{FlowHead} (two convolutional layers) predicts a residual $\Delta\vect{d}^{(t)}$ from the hidden state, and the flow is updated: $\hat{\vect{d}}^{(t)} = \hat{\vect{d}}^{(t-1)} + \Delta\vect{d}^{(t)}$.
+
+    \item \textbf{Convex upsampling.}
+    A \emph{MaskHead} predicts a $8 \times 8 \times 9$ weight mask from the hidden state.
+    The $1/8$-resolution flow is upsampled $8\times$ by taking a softmax-weighted convex combination of each pixel's $3 \times 3$ neighbourhood:
+    \begin{equation}
+        \hat{\vect{d}}_\text{HR}(p) = \sum_{k=1}^{9} w_k(p)\, \hat{\vect{d}}_\text{LR}(\text{nb}_k(p)),
+        \label{eq:convex_up}
+    \end{equation}
+    where $w_k$ are the softmax weights. This produces sharper flow boundaries than bilinear interpolation.
+\end{enumerate}
+
+\subsection{Training Details}
+
+Both models are trained for 80 epochs on 4{,}000 synthetically generated samples per epoch, with 400 validation samples.
+The RAFT model uses AdamW~\cite{loshchilov2019adamw} with learning rate $2 \times 10^{-4}$ and weight decay $10^{-5}$, with cosine annealing reducing the learning rate to $1\%$ of its initial value.
+Automatic mixed precision (AMP)~\cite{micikevicius2018mixed} is used for memory efficiency, and gradient norms are clipped at 1.0 to stabilise training.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Experiments and Results}
+\label{sec:results}
+
+\subsection{Evaluation Metrics}
+
+The primary metric is the \textbf{End-Point Error (EPE)}: the mean Euclidean distance between predicted and ground-truth displacement vectors:
+\begin{equation}
+    \text{EPE} = \frac{1}{|\Omega|} \sum_{\vect{q} \in \Omega} \sqrt{(\hat{u}(\vect{q}) - u^*(\vect{q}))^2 + (\hat{v}(\vect{q}) - v^*(\vect{q}))^2}.
+    \label{eq:epe}
+\end{equation}
+Note that EPE is computed only during evaluation---it is never used as a training signal.
+I also report the mean divergence $\|\nabla \cdot \hat{\vect{d}}\|^2$ and smoothness $\|\nabla \hat{\vect{d}}\|^2$ of the predicted flow.
+
+\subsection{U-Net vs.\ RAFT Comparison}
+
+\Cref{tab:comparison} summarises the final performance of both architectures.
+
+\begin{table}[H]
+    \centering
+    \caption{Quantitative comparison of the U-Net baseline and RAFT model on synthetic particle images ($256 \times 256$, max displacement 8\,px).}
+    \label{tab:comparison}
+    \begin{tabular}{lccc}
+        \toprule
+        \textbf{Metric} & \textbf{U-Net} & \textbf{RAFT} & \textbf{Improvement} \\
+        \midrule
+        End-Point Error (px) & 0.87 & \textbf{0.31} & $2.8\times$ \\
+        Divergence           & 0.020 & \textbf{0.002} & $10\times$ \\
+        Smoothness           & 0.085 & \textbf{0.006} & $14\times$ \\
+        Relative Error       & 10.9\% & \textbf{3.9\%} & --- \\
+        Parameters           & 7.8M & 7.1M & --- \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The RAFT model achieves sub-pixel accuracy (0.31\,px EPE) with dramatically lower divergence and smoothness losses, indicating that the predicted flow fields are both more accurate and more physically plausible.
+Notably, the RAFT model achieves this with \emph{fewer} parameters than the U-Net, suggesting that the architectural inductive biases (correlation volumes, iterative refinement) are more important than raw model capacity.
+
+\subsection{Qualitative Results}
+
+\Cref{fig:vortex_flow,fig:channel_flow,fig:multi_vortex_flow} show predicted vs.\ ground-truth flow fields for three representative flow types, visualised using HSV colour coding (hue encodes direction, brightness encodes magnitude).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{vortex/sample_00_2_flow_hsv.png}
+    \caption{Lamb--Oseen vortex flow: predicted (left) vs.\ ground truth (right). The model captures the rotational structure and radial decay of the vortex accurately.}
+    \label{fig:vortex_flow}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{channel/sample_00_2_flow_hsv.png}
+    \caption{Channel (Poiseuille) flow: predicted (left) vs.\ ground truth (right). The parabolic velocity profile is faithfully recovered, though minor artifacts are visible near the walls.}
+    \label{fig:channel_flow}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{multi_vortex/sample_00_2_flow_hsv.png}
+    \caption{Multi-vortex flow: predicted (left) vs.\ ground truth (right). The model successfully resolves the superposition of multiple vortices with different circulations and positions.}
+    \label{fig:multi_vortex_flow}
+\end{figure}
+
+\Cref{fig:quiver} shows a quiver plot comparison for the vortex flow, overlaid on the particle image.
+The predicted flow arrows closely match the ground truth in both direction and magnitude.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{vortex/sample_00_3_quiver.png}
+    \caption{Quiver plot for vortex flow: predicted (left) vs.\ ground truth (right), overlaid on the particle image. Arrow colour indicates magnitude (cyan = low, magenta = high).}
+    \label{fig:quiver}
+\end{figure}
+
+\Cref{fig:error_div} presents the spatial distribution of end-point error and divergence for a vortex sample.
+The error is concentrated near the vortex core where the velocity gradient is steepest, which is consistent with the difficulty of resolving rapid spatial variations at $1/8$ resolution.
+The divergence field is nearly zero everywhere, confirming that the divergence loss effectively enforces the incompressibility constraint.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{vortex/sample_00_5_error_div.png}
+    \caption{End-point error heatmap (left, mean 0.47\,px) and divergence field (right) for a vortex sample. Error is highest at the vortex core; divergence is near zero everywhere.}
+    \label{fig:error_div}
+\end{figure}
+
+\Cref{fig:frames} shows a typical input particle image pair, illustrating the subtle displacement of particles between frames that the network must detect.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{vortex/sample_00_1_frames.png}
+    \caption{A synthetic particle image pair (vortex flow). The displacement between frame~1 and frame~2 is at most 8 pixels---difficult to discern by eye.}
+    \label{fig:frames}
+\end{figure}
+
+\subsection{Development Insights}
+
+A critical bug encountered during development illustrates an important subtlety of image warping.
+The flow field is defined in the \emph{forward} direction (frame~1 $\to$ frame~2), but PyTorch's \texttt{grid\_sample} performs \emph{backward} sampling: it asks ``where in the source image should I sample to fill this output pixel?''
+The correct warping formula is therefore $\tilde{I}_1(\vect{q}) = I_1(\vect{q} - \hat{\vect{d}}(\vect{q}))$, using subtraction.
+An initial implementation using addition caused the model to learn $\hat{\vect{d}} \approx -\vect{d}^*$ to compensate, resulting in a photometric loss that decreased while the EPE diverged.
+Correcting this sign error immediately reduced the U-Net EPE from 4.3 to 0.87\,px.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Discussion and Conclusion}
+\label{sec:conclusion}
+
+This project demonstrates that self-supervised deep learning can achieve sub-pixel accuracy for dense displacement estimation in PIV-like settings, without requiring any ground-truth flow labels.
+The key findings are:
+
+\begin{enumerate}
+    \item \textbf{Iterative refinement outperforms single-pass regression.}
+    The RAFT model's correlation volumes provide an explicit mechanism for feature matching between frames, and the ConvGRU enables progressive correction of the flow estimate.
+    This $2.8\times$ improvement over the U-Net comes with fewer parameters, highlighting the importance of architectural design over model capacity.
+
+    \item \textbf{Physics-informed losses improve physical plausibility.}
+    The divergence loss reduces the mean divergence by $10\times$ compared to the U-Net, producing flow fields that respect the incompressibility constraint.
+    The connection between the smoothness loss and the classical Horn--Schunck regulariser (\cref{eq:horn_schunck}) illustrates how variational principles from applied mathematics can be embedded into neural network training.
+
+    \item \textbf{SSIM is critical for particle images.}
+    Blending the Charbonnier loss with SSIM prevents the model from converging to local minima where it matches the wrong particles.
+    The structural comparison enforced by SSIM provides a richer gradient signal than pixel-wise losses alone.
+
+    \item \textbf{Warping direction matters.}
+    The distinction between forward flow and backward sampling is a mathematical subtlety with major practical consequences, as the sign-error bug demonstrated.
+\end{enumerate}
+
+\paragraph{Limitations.}
+The current approach trains and evaluates on synthetic data only.
+Real PIV images exhibit non-uniform illumination, out-of-plane particle motion, and optical distortions that are not captured by the synthetic generator.
+Additionally, the maximum displacement of 8\,px is modest; scaling to larger displacements would require multi-scale correlation volumes or coarse-to-fine strategies.
+
+\paragraph{Future work.}
+Possible extensions include:
+(i)~domain adaptation techniques to bridge the gap between synthetic and real PIV images;
+(ii)~incorporating temporal consistency across more than two frames;
+(iii)~extending to 3D volumetric PIV (tomographic PIV) where the displacement field has three components;
+and (iv)~testing on established PIV benchmarks to compare with traditional correlation-based methods.
+
+In summary, by combining the iterative refinement paradigm of RAFT with self-supervised, physics-informed losses, this project achieves accurate dense displacement estimation that respects the underlying fluid mechanics---a compelling example of how ideas from applied mathematics and deep learning can be synergistically combined.
+
+% ══════════════════════════════════════════════════════════════════
+\printbibliography
+
+\end{document}
